@@ -1,26 +1,110 @@
 import asyncio
 
-from twikit import Client
+import argparse
 
 import json
 
-from datetime import datetime
-
-import uuid
-
 import os
 
+import re
+
+from datetime import datetime
+
+from dateutil import parser as date_parser
+
+from twikit import Client
+
+from common.data import DataEntity
 
 
-# Настройки
 
-SCREEN_NAME = "elonmusk"
+# === CLI ===
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument("--screen_name", type=str, required=True, help="Twitter username (без @)")
+
+parser.add_argument("--count", type=int, default=100, help="Количество твитов (по умолчанию 100)")
+
+parser.add_argument("--keywords", type=str, help="Ключевые слова через запятую (например: ai,ethics,startup)")
+
+args = parser.parse_args()
+
+
+
+# === Настройки ===
 
 COOKIES_PATH = "twitter_cookies.json"
 
-OUTPUT_DIR = "scraped_data"
+OUTPUT_DIR = "normalized"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
+
+FILENAME = f"twitter_{args.screen_name}_{datetime.now().strftime('%Y-%m-%d')}.jsonl"
+
+OUTPUT_PATH = os.path.join(OUTPUT_DIR, FILENAME)
+
+
+
+# === Фильтрация ===
+
+keywords = [k.strip().lower() for k in args.keywords.split(",")] if args.keywords else []
+
+
+
+def is_english(text):
+
+    words = text.split()
+
+    if not words:
+
+        return False
+
+    latin_words = [w for w in words if re.fullmatch(r"[A-Za-z0-9\-@#]+", w)]
+
+    return len(latin_words) / len(words) > 0.8
+
+
+
+def is_valid(tweet):
+
+    text = tweet.full_text.strip()
+
+    lower_text = text.lower()
+
+
+
+    if lower_text.startswith("rt @") or lower_text.startswith("@"):
+
+        return False  # ретвиты и реплаи
+
+
+
+    if len(text) < 30 or "http" in lower_text:
+
+        return False
+
+
+
+    if keywords and not any(k in lower_text for k in keywords):
+
+        return False
+
+
+
+    if not is_english(text):
+
+        return False
+
+
+
+    return True
+
+
+
+# === Асинхронная логика ===
 
 async def main():
 
@@ -30,73 +114,66 @@ async def main():
 
 
 
-    user = await client.get_user_by_screen_name(SCREEN_NAME)
+    user = await client.get_user_by_screen_name(args.screen_name)
 
-    tweets = await user.get_tweets(tweet_type="Tweets", count=10)
+    tweets = await user.get_tweets(tweet_type="Tweets", count=args.count)
 
 
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    index_entries = []
+    entities = []
 
 
 
     for tweet in tweets:
 
-        uid = str(uuid.uuid4())
+        if not is_valid(tweet):
 
-        data = {
-
-            "id": uid,
-
-            "text": tweet.full_text,
-
-            "timestamp": tweet.created_at,
-
-            "author": SCREEN_NAME,
-
-            "source": "twitter"
-
-        }
+            continue
 
 
 
-        file_path = os.path.join(OUTPUT_DIR, f"{uid}.jsonl")
+        entity = DataEntity(
 
-        with open(file_path, "w", encoding="utf-8") as f:
+            id=str(tweet.id),
 
-            f.write(json.dumps(data, ensure_ascii=False) + "\n")
+            source=1,  # Twitter
 
+            uri=f"https://twitter.com/{tweet.user.screen_name}/status/{tweet.id}",
 
+            datetime=date_parser.parse(tweet.created_at).isoformat(),
 
-        index_entries.append({
+            content=tweet.full_text.strip(),
 
-            "id": uid,
+            content_size_bytes=len(tweet.full_text.encode("utf-8")),
 
-            "file_name": os.path.basename(file_path),
+            labels=[],
 
-            "timestamp": data["timestamp"]
+            metadata={
 
-        })
+                "user": tweet.user.screen_name
 
+            }
 
+        )
 
-    index_path = os.path.join(OUTPUT_DIR, "index.json")
-
-    with open(index_path, "w", encoding="utf-8") as f:
-
-        json.dump(index_entries, f, indent=2, ensure_ascii=False)
-
-
-
-    print(f"✅ Скрапинг завершён. Сохранено {len(tweets)} твитов в папку {OUTPUT_DIR}")
+        entities.append(entity)
 
 
 
-# Запуск
+    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+
+        for entity in entities:
+
+            f.write(json.dumps(entity.model_dump(), ensure_ascii=False, default=str) + "\n")
+
+
+
+    print(f"✅ Сохранено {len(entities)} твитов в {OUTPUT_PATH}")
+
+
+
+# === Запуск ===
 
 asyncio.run(main())
-
 
 
