@@ -39,8 +39,8 @@ async def scrape_twitter():
             entities.append({
                 "uri": f"https://twitter.com/i/web/status/{tweet.id}",
                 "datetime": tweet.created_at,
-                "source": 2,
-                "label": None,
+                "source": "X",
+                "label": {"name": term},
                 "content": text,
                 "content_size_bytes": len(text.encode("utf-8"))
             })

@@ -34,7 +34,7 @@ def scrape_reddit():
                 entities.append({
                     "uri": uri,
                     "datetime": created_at,
-                    "source": 1,
+                    "source": "REDDIT",
                     "label": sub_name,
                     "content": text,
                     "content_size_bytes": len(content_bytes)

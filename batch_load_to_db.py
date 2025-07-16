@@ -8,7 +8,7 @@ from loader import to_data_entity
 def main():
     # config.json должен лежать рядом с этим скриптом
     cfg = json.load(open("config.json", "r", encoding="utf-8"))
-    db_path = cfg["db_path"]
+    db_path = os.path.abspath(cfg["db_path"])
     files = sorted(f for f in os.listdir("normalized") if f.endswith(".jsonl"))
 
     conn = sqlite3.connect(db_path)
@@ -61,7 +61,9 @@ def main():
                     )
                     if cursor.rowcount:
                         inserted += 1
-
+                        print(f"✅ Вставлено: {uri}")
+                    else:
+                        print(f"⛔️ Пропущено (возможно дубликат или ошибка данных): {uri}")
                 except Exception as e:
                     # при ошибке выводим URI, чтобы можно было отлаживать
                     print(f"⚠️ Ошибка при вставке {raw.get('uri', '')}: {e}")
