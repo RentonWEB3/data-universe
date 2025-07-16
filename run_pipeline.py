@@ -1,152 +1,71 @@
-
-
-import argparse
-
+#!/usr/bin/env python3
 import os
+import json
+import asyncio
+from datetime import datetime
 
-import datetime
+# 1) Твиттер
+from twikit_scraper import scrape_twitter
 
-import logging
+# 2) Реддит
+from reddit_scraper import scrape_reddit
 
-import sys
+# 3) Загрузчик в БД
+from loader import load_entities
+from common.data import DataSource
 
+# 4) Hugging Face
+import bittensor as bt
+from huggingface_utils.huggingface_uploader import DualUploader
+from huggingface_utils.encoding_system import EncodingKeyManager
 
+def load_config():
+    with open("config.json", "r", encoding="utf-8") as f:
+        return json.load(f)
 
-from huggingface_hub import HfApi
+async def main():
+    cfg = load_config()
 
+    # ——— TWITTER ———
+    twitter_data = await scrape_twitter()
+    print(f"\nВсего твитов собрано: {len(twitter_data)}\n")
 
+    # ——— REDDIT ———
+    reddit_data = scrape_reddit()
+    count = load_entities("normalized")
+    print(f"\nВсего Reddit-записей добавлено в БД: {count}\n")
 
-# Добавляем текущую директорию в sys.path
+  # ——— HUGGING FACE UPLOAD ———
+    db_path    = cfg["db_path"]
+    s3_url     = cfg.get("s3_auth_url", "")
+    state_file = cfg.get("state_file", "upload_state.json")
 
-sys.path.append(os.path.dirname(__file__))
+    subtensor = bt.subtensor()
+    wallet    = bt.wallet()
+    enc_mgr   = EncodingKeyManager()
 
-
-
-# Импорты (при необходимости адаптируй пути)
-
-from twikit_scraper import scrape_tweets
-
-from normalize_twitter import normalize_twitter
-
-from normalize_reddit import normalize_reddit
-
-from add_weights import apply_desirability_weight
-
-from common.data import DataEntityBucket
-
-from scraping.reddit_scraper import scrape_reddit_posts
-
-
-
-logging.basicConfig(level=logging.INFO)
-
-
-
-def main():
-
-    parser = argparse.ArgumentParser(description="Unified Twitter + Reddit pipeline with HF upload")
-
-    parser.add_argument('--twitter_screen_name', type=str, required=True)
-
-    parser.add_argument('--twitter_keywords', type=str, required=True)
-
-    parser.add_argument('--reddit_subreddits', type=str, required=True)
-
-    parser.add_argument('--limit', type=int, default=100)
-
-    parser.add_argument('--hf_repo', type=str, default="RentonWEB3/crypto-data")
-
-    parser.add_argument('--hf_token', type=str, required=True)
-
-    args = parser.parse_args()
-
-
-
-    logging.info("📡 Scraping Twitter...")
-
-    twitter_raw = scrape_tweets(
-
-        screen_name=args.twitter_screen_name,
-
-        keywords=args.twitter_keywords.split(','),
-
-        limit=args.limit
-
+    uploader = DualUploader(
+        db_path=db_path,
+        subtensor=subtensor,
+        wallet=wallet,
+        encoding_key_manager=enc_mgr,
+        private_encoding_key_manager=enc_mgr,
+        s3_auth_url=s3_url,
+        state_file=state_file
     )
 
+    # если у вас не настроен S3 — ставим заглушку
+    if uploader.s3_auth is None:
+        class DummyS3Auth:
+            def get_credentials(self, *args, **kwargs):
+                return None
+        uploader.s3_auth = DummyS3Auth()
 
-
-    logging.info("📡 Scraping Reddit...")
-
-    reddit_raw = scrape_reddit_posts(
-
-        subreddits=args.reddit_subreddits.split(','),
-
-        limit=args.limit
-
-    )
-
-
-
-    logging.info("🧼 Normalizing...")
-
-    twitter_entities = normalize_twitter(twitter_raw)
-
-    reddit_entities = normalize_reddit(reddit_raw)
-
-    all_entities = twitter_entities + reddit_entities
-
-
-
-    logging.info("⚖️ Applying desirability weights...")
-
-    weighted_entities = apply_desirability_weight(all_entities)
-
-
-
-    bucket = DataEntityBucket()
-
-    for entity in weighted_entities:
-
-        bucket.add(entity)
-
-
-
-    os.makedirs("output", exist_ok=True)
-
-    filename = f"output/data_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json.lz4"
-
-    bucket.save_to_file(filename)
-
-    logging.info(f"✅ Saved: {filename}")
-
-
-
-    logging.info("🚀 Uploading to Hugging Face...")
-
-    hf = HfApi()
-
-    hf.upload_file(
-
-        path_or_fileobj=filename,
-
-        path_in_repo=os.path.basename(filename),
-
-        repo_id=args.hf_repo,
-
-        repo_type="dataset",
-
-        token=args.hf_token
-
-    )
-
-
-
-    logging.info("🎯 Done! File sent for validation by subnet.")
-
-
+    print("=== Начинаем загрузку на Hugging Face ===")
+    metadata = uploader.upload_sql_to_huggingface()
+    print("\n=== Загрузка завершена. Метаданные: ===")
+    for m in metadata:
+        print(m)
 
 if __name__ == "__main__":
-
-    main()
-
+    asyncio.run(main())

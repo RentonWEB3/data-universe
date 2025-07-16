@@ -1,179 +1,79 @@
-import asyncio
 
-import argparse
-
-import json
 
 import os
+import json
+import asyncio
+from datetime import datetime as _dt
+from twikit import Client, errors as twikit_errors
 
-import re
+def load_config():
+    """Читает config.json из корня проекта."""
+    with open("config.json", "r", encoding="utf-8") as f:
+        return json.load(f)
 
-from datetime import datetime
+def is_valid(tweet) -> bool:
+    """Проверяет, что у твита есть id, текст и время."""
+    return getattr(tweet, "id", None) and getattr(tweet, "text", None) and getattr(tweet, "created_at", None)
 
-from dateutil import parser as date_parser
-
-from twikit import Client
-
-from common.data import DataEntity
-
-
-
-# === CLI ===
-
-parser = argparse.ArgumentParser()
-
-parser.add_argument("--screen_name", type=str, required=True, help="Twitter username (без @)")
-
-parser.add_argument("--count", type=int, default=100, help="Количество твитов (по умолчанию 100)")
-
-parser.add_argument("--keywords", type=str, help="Ключевые слова через запятую (например: ai,ethics,startup)")
-
-args = parser.parse_args()
-
-
-
-# === Настройки ===
-
-COOKIES_PATH = "twitter_cookies.json"
-
-OUTPUT_DIR = "normalized"
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-
-
-FILENAME = f"twitter_{args.screen_name}_{datetime.now().strftime('%Y-%m-%d')}.jsonl"
-
-OUTPUT_PATH = os.path.join(OUTPUT_DIR, FILENAME)
-
-
-
-# === Фильтрация ===
-
-keywords = [k.strip().lower() for k in args.keywords.split(",")] if args.keywords else []
-
-
-
-def is_english(text):
-
-    words = text.split()
-
-    if not words:
-
-        return False
-
-    latin_words = [w for w in words if re.fullmatch(r"[A-Za-z0-9\-@#]+", w)]
-
-    return len(latin_words) / len(words) > 0.8
-
-
-
-def is_valid(tweet):
-
-    text = tweet.full_text.strip()
-
-    lower_text = text.lower()
-
-
-
-    if lower_text.startswith("rt @") or lower_text.startswith("@"):
-
-        return False  # ретвиты и реплаи
-
-
-
-    if len(text) < 30 or "http" in lower_text:
-
-        return False
-
-
-
-    if keywords and not any(k in lower_text for k in keywords):
-
-        return False
-
-
-
-    if not is_english(text):
-
-        return False
-
-
-
-    return True
-
-
-
-# === Асинхронная логика ===
-
-async def main():
+async def scrape_twitter():
+    cfg = load_config()
 
     client = Client()
-
-    client.load_cookies(COOKIES_PATH)
-
-
-
-    user = await client.get_user_by_screen_name(args.screen_name)
-
-    tweets = await user.get_tweets(tweet_type="Tweets", count=args.count)
-
-
+    client.load_cookies(cfg["cookies_file"])
+    print(f"Куки загружены из файла: {cfg['cookies_file']}")
 
     entities = []
-
-
-
-    for tweet in tweets:
-
-        if not is_valid(tweet):
-
+    for term in cfg["search_keywords"]:
+        print(f"--- Поиск по ключевому слову: '{term}'")
+        try:
+            result = await client.search_tweet(term, "latest", cfg["tweets_per_keyword"])
+            print("Пауза 20 сек для троттлинга…")
+            await asyncio.sleep(20)
+        except twikit_errors.NotFound:
+            print(f"WARNING: '{term}' вернул 404, пропускаем")
+            continue
+        except Exception as e:
+            print(f"ERROR: при поиске '{term}': {e}, пропускаем")
             continue
 
+        tweets = getattr(result, "data", result)
+        for tweet in tweets:
+            if not is_valid(tweet):
+                continue
 
+            text = tweet.text
+            entities.append({
+                "uri": f"https://twitter.com/i/web/status/{tweet.id}",
+                "datetime": str(tweet.created_at),  # чтобы совпадало с DataEntity
+                "content": tweet.text,                     # legacy
+                "label": {"keyword": term},
+                "content_size_bytes": len(text.encode("utf-8")),
+                "source": 2
+             })
 
-        entity = DataEntity(
+        # небольшая пауза между ключевыми словами
+        await asyncio.sleep(1)
 
-            id=str(tweet.id),
+    # дедупликация
+        seen = set()
+        unique = []
+        for e in entities:
+            uri = e.get("uri")
+            if not uri or uri in seen:
+                continue
+            seen.add(uri)
+            unique.append(e)
+        print(f"После дедупликации: {len(unique)} твитов")
 
-            source=1,  # Twitter
+    # сохраняем в normalized/twitter_YYYYMMDD_HHMM.jsonl
+    os.makedirs("normalized", exist_ok=True)
+    out_file = f"normalized/twitter_{_dt.utcnow().strftime('%Y%m%d_%H%M')}.jsonl"
+    with open(out_file, "w", encoding="utf-8") as f:
+        for e in unique:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    print(f"Сохранено: {out_file}")
 
-            uri=f"https://twitter.com/{tweet.user.screen_name}/status/{tweet.id}",
+    return unique
 
-            datetime=date_parser.parse(tweet.created_at).isoformat(),
-
-            content=tweet.full_text.strip(),
-
-            content_size_bytes=len(tweet.full_text.encode("utf-8")),
-
-            labels=[],
-
-            metadata={
-
-                "user": tweet.user.screen_name
-
-            }
-
-        )
-
-        entities.append(entity)
-
-
-
-    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
-
-        for entity in entities:
-
-            f.write(json.dumps(entity.model_dump(), ensure_ascii=False, default=str) + "\n")
-
-
-
-    print(f"✅ Сохранено {len(entities)} твитов в {OUTPUT_PATH}")
-
-
-
-# === Запуск ===
-
-asyncio.run(main())
-
-
+if __name__ == "__main__":
+    asyncio.run(scrape_twitter())
