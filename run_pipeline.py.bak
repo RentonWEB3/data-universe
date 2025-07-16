@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import json
+import asyncio
+
+# Чтобы импортировать локальные модули
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
+# 1) Twitter-скрапер
+from twikit_scraper import scrape_twitter
+
+# 2) Reddit-скрапер
+from reddit_scraper import scrape_reddit
+
+# Загрузка сущностей в базу
+from loader import load_entities_into_db
+
+# Enum источников
+from common.data import DataSource
+
+# Bittensor для DualUploader
+import bittensor as bt
+
+# Hugging Face uploader
+from huggingface_utils.huggingface_uploader import DualUploader
+from huggingface_utils.encoding_key_manager import EncodingKeyManager
+
+
+async def main():
+    # Загружаем конфиг
+    cfg = json.load(open("config.json", "r", encoding="utf-8"))
+
+    # === 1) Twitter ===
+    twitter_data = await scrape_twitter()
+    print(f"\nВсего твитов собрано: {len(twitter_data)}\n")
+
+    # === 2) Reddit ===
+    rd_entities = scrape_reddit()
+    rd_count = load_entities_into_db(
+        rd_entities,
+        DataSource.REDDIT.value,
+        cfg["db_path"]
+    )
+    print(f"\nВсего Reddit-записей добавлено в БД: {rd_count}\n")
+
+    # === 3) Выгрузка на Hugging Face ===
+    db_path = cfg["db_path"]
+    s3_url = cfg.get("s3_auth_url", "")
+    state_file = cfg.get("state_file", "upload_state.json")
+
+    # Инициализируем Bittensor
+    subtensor = bt.subtensor()
+    wallet = bt.wallet()
+
+    # Менеджер ключей
+    enc_mgr = EncodingKeyManager()
+
+    uploader = DualUploader(
+        db_path=db_path,
+        subtensor=subtensor,
+        wallet=wallet,
+        encoding_key_manager=enc_mgr,
+        private_encoding_key_manager=enc_mgr,
+        s3_auth_url=s3_url,
+        state_file=state_file
+    )
+
+    # Если S3 не настроен, ставим «заглушку»
+    if uploader.s3_auth is None:
+        class DummyS3Auth:
+            def get_credentials(self, *args, **kwargs):
+                return None
+        uploader.s3_auth = DummyS3Auth()
+
+    print("=== Начинаем загрузку на Hugging Face ===")
+    metadata = uploader.upload_sql_to_huggingface()
+    print("\n=== Загрузка завершена. Метаданные: ===")
+    for m in metadata:
+        print(m)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

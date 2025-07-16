@@ -1,0 +1,69 @@
+import json
+import asyncio
+import time
+import os
+from datetime import datetime
+from twikit import Client
+
+# 1) Загрузка конфига
+def load_config():
+    with open("config.json", "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    print("Конфиг загружен:", cfg)
+    return cfg
+
+# 2) Фильтр твита (можно дорабатывать)
+def is_valid(tweet):
+    # Пример: пропускаем только англоязычные
+    # if tweet.lang != "en": return False
+    return True
+
+# 3) Основная функция скрапинга твитов
+async def scrape_twitter():
+    cfg = load_config()
+
+    # Создаём клиента и подгружаем куки
+    client = Client()
+    client.load_cookies(cfg["cookies_file"])
+    print(f"Куки загружены из файла: {cfg['cookies_file']}")
+
+    entities = []
+    keywords = cfg["search_keywords"]
+    per_kw = cfg["tweets_per_keyword"]
+
+    # 4) Цикл по ключевым словам
+    for term in keywords:
+        print(f"--- Поиск по ключевому слову: '{term}' (макс {per_kw})")
+        result = await client.search_tweet(q=term, count=per_kw, lang="en")
+        count_before = len(entities)
+        async for tweet in result:
+            if not is_valid(tweet):
+                continue
+            ent = {
+                "id": tweet.id,
+                "text": tweet.text,
+                "created_at": str(tweet.created_at),
+                "keyword": term
+            }
+            entities.append(ent)
+        print(f"Новых твитов добавлено: {len(entities) - count_before} (всего {len(entities)})")
+        await asyncio.sleep(1)  # пауза между запросами
+
+    # 5) Дедупликация по id
+    unique = list({e["id"]: e for e in entities}.values())
+    print(f"После дедупликации осталось: {len(unique)} твитов")
+
+    # 6) Сохранение в JSONL
+    os.makedirs("normalized", exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M")
+    out_file = f"normalized/twitter_{ts}.jsonl"
+    with open(out_file, "w", encoding="utf-8") as f:
+        for e in unique:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    print(f"Данные успешно сохранены в файл: {out_file}")
+
+    return unique
+
+# Тестовый запуск из консоли
+if __name__ == "__main__":
+    asyncio.run(scrape_twitter())

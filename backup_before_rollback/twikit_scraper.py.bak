@@ -1,0 +1,63 @@
+import json
+import asyncio
+import os
+from datetime import datetime
+from twikit import Client
+
+def load_config():
+    with open("config.json", "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    print("Конфиг загружен:", cfg)
+    return cfg
+
+def is_valid(tweet):
+    return True  # доп. фильтры можно добавить позже
+
+async def scrape_twitter():
+    cfg = load_config()
+
+    client = Client()
+    client.load_cookies(cfg["cookies_file"])
+    print(f"Куки загружены из файла: {cfg['cookies_file']}")
+
+    entities = []
+    keywords = cfg["search_keywords"]
+    per_kw = cfg["tweets_per_keyword"]
+
+    for term in keywords:
+        print(f"--- Поиск по ключевому слову: '{term}' (макс {per_kw})")
+        # ПРАВИЛЬНЫЙ ВЫЗОВ search_tweet:
+        # 1) query (term), 2) product ('latest'), 3) count (per_kw)
+        result = await client.search_tweet(term, 'latest', per_kw)
+        before = len(entities)
+        # result.data может отсутствовать, но мы можем итерировать result directly if it's iterable
+        tweets = getattr(result, 'data', result)
+        for tweet in tweets:
+            if not is_valid(tweet):
+                continue
+            entities.append({
+                "id": tweet.id,
+                "text": tweet.text,
+                "created_at": str(tweet.created_at),
+                "keyword": term
+            })
+        print(f"Новых твитов добавлено: {len(entities) - before} (всего {len(entities)})")
+        await asyncio.sleep(1)
+
+    # Дедупликация
+    unique = list({e["id"]: e for e in entities}.values())
+    print(f"После дедупликации осталось: {len(unique)} твитов")
+
+    # Сохранение
+    os.makedirs("normalized", exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M")
+    out_file = f"normalized/twitter_{ts}.jsonl"
+    with open(out_file, "w", encoding="utf-8") as f:
+        for e in unique:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    print(f"Данные успешно сохранены в файл: {out_file}")
+
+    return unique
+
+if __name__ == "__main__":
+    asyncio.run(scrape_twitter())

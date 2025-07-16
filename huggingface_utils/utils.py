@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import bittensor as bt
 from huggingface_utils.encoding_system import EncodingKeyManager, encode_url
+import re
 
 # Constants
 TWEET_DATASET_COLUMNS = ['text', 'label', 'tweet_hashtags', 'datetime', 'username_encoded', 'url_encoded']
@@ -189,113 +190,168 @@ def parallel_encode_batch(items: pd.Series, fernet) -> pd.Series:
     
     return pd.concat(results) if results else pd.Series(dtype=object)
 
+# файл: huggingface_utils/utils.py
 
-def preprocess_twitter_df(df: pd.DataFrame, encoding_key_manager: EncodingKeyManager,
-                          private_encoding_key_manager: EncodingKeyManager) -> pd.DataFrame:
-    """Preprocess Twitter DataFrame with empty text filtering and dual-key encoding."""
-    try:
-        # Log initial count
-        initial_count = len(df)
-        bt.logging.info(f"Starting Twitter preprocessing with {initial_count} rows")
-        
-        # Vectorized content decoding
-        df['content'] = df['content'].apply(decode_content)
-        
-        # Extract fields using vectorized operations
-        result_df = pd.DataFrame({
-            'text': df['content'].apply(lambda x: x.get('text')),
-            'tweet_hashtags': df['content'].apply(lambda x: x.get('tweet_hashtags')),
-            'label': df['label'],
-            'datetime': pd.to_datetime(df['datetime']).dt.strftime('%Y-%m-%d')
-        })
-        
-        # Filter out rows with empty text
-        valid_text_mask = result_df['text'].notna() & (result_df['text'].str.strip() != '')
-        result_df = result_df[valid_text_mask]
-        
-        if len(result_df) == 0:
-            bt.logging.warning("All Twitter rows filtered out due to empty text fields")
-            return pd.DataFrame(columns=TWEET_DATASET_COLUMNS)
-            
-        # Log filtered count
-        filtered_count = len(result_df)
-        removed_count = initial_count - filtered_count
-        bt.logging.info(f"Removed {removed_count} Twitter rows with empty text. Remaining rows: {filtered_count}")
-        
-        # Extract username and URL series from original data
-        filtered_content = df.loc[valid_text_mask, 'content']
-        usernames = filtered_content.apply(lambda x: x.get('username', ''))
-        urls = filtered_content.apply(lambda x: x.get('url', ''))
-        
-        # Get Fernet instances
-        public_fernet = encoding_key_manager.get_fernet()
-        private_fernet = private_encoding_key_manager.get_fernet()
-        
-        # Parallel encoding with respective keys (username with public key, URL with private key)
-        result_df['username_encoded'] = parallel_encode_batch(usernames, public_fernet)
-        result_df['url_encoded'] = parallel_encode_batch(urls, private_fernet)
-        
-        # Memory cleanup
-        df = None
-        filtered_content = None
-        
-        return result_df[TWEET_DATASET_COLUMNS]
-        
-    except Exception as e:
-        bt.logging.error(f"Error in Twitter preprocessing: {e}")
-        raise
+import pandas as pd
+import re
+import bittensor as bt
+from huggingface_utils.encoding_system import EncodingKeyManager
 
-def preprocess_reddit_df(df: pd.DataFrame, encoding_key_manager: EncodingKeyManager, private_encoding_key_manager: EncodingKeyManager) -> pd.DataFrame:
-    """Preprocess Reddit DataFrame with empty text filtering and dual-key encoding."""
+# файл: huggingface_utils/utils.py
+
+import pandas as pd
+import re
+import bittensor as bt
+from huggingface_utils.encoding_system import EncodingKeyManager
+
+def preprocess_twitter_df(
+    df: pd.DataFrame,
+    encoding_key_manager: EncodingKeyManager,
+    private_encoding_key_manager: EncodingKeyManager
+) -> pd.DataFrame:
+    """
+    Приводим Twitter-данные к единому формату:
+    - datetime — к pandas.Timestamp
+    - text      — из поля content (строка)
+    - tweet_hashtags — список хэштегов
+    - label     — хэштеги, склеенные строкой (может быть пустая)
+    - кодируем username и url (если есть колонки)
+    """
+
     try:
-        # Log initial count
-        initial_count = len(df)
-        bt.logging.info(f"Starting Reddit preprocessing with {initial_count} rows")
-        
-        # Vectorized content decoding
-        df['content'] = df['content'].apply(decode_content)
-        
-        # Extract fields using vectorized operations
-        result_df = pd.DataFrame({
-            'text': df['content'].apply(lambda x: x.get('body')),
-            'dataType': df['content'].apply(lambda x: x.get('dataType')),
-            'communityName': df['content'].apply(lambda x: x.get('communityName')),
-            'label': df['label'],
-            'datetime': pd.to_datetime(df['datetime']).dt.strftime('%Y-%m-%d')
-        })
-        
-        # Filter out rows with empty text
-        valid_text_mask = result_df['text'].notna() & (result_df['text'].str.strip() != '')
-        result_df = result_df[valid_text_mask]
-        
-        if len(result_df) == 0:
-            bt.logging.warning("All Reddit rows filtered out due to empty text fields")
-            return pd.DataFrame(columns=REDDIT_DATASET_COLUMNS)
-            
-        # Log filtered count
-        filtered_count = len(result_df)
-        removed_count = initial_count - filtered_count
-        bt.logging.info(f"Removed {removed_count} Reddit rows with empty text. Remaining rows: {filtered_count}")
-        
-        # Extract username and URL series from original data
-        filtered_content = df.loc[valid_text_mask, 'content']
-        usernames = filtered_content.apply(lambda x: x.get('username', ''))
-        urls = filtered_content.apply(lambda x: x.get('url', ''))
-        
-        # Get Fernet instances
-        public_fernet = encoding_key_manager.get_fernet()
-        private_fernet = private_encoding_key_manager.get_fernet()
-        
-        # Parallel encoding with respective keys (username with public key, URL with private key)
-        result_df['username_encoded'] = parallel_encode_batch(usernames, public_fernet)
-        result_df['url_encoded'] = parallel_encode_batch(urls, private_fernet)
-        
-        # Memory cleanup
-        df = None
-        filtered_content = None
-        
-        return result_df[REDDIT_DATASET_COLUMNS]
-        
+        bt.logging.info(f"Starting Twitter preprocessing with {len(df)} rows")
+
+        # Шаг 1: datetime
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+
+        # Шаг 2: переименуем content в text (если нет text)
+        if "content" in df.columns and "text" not in df.columns:
+            df = df.rename(columns={"content": "text"})
+        elif "text" not in df.columns:
+            df["text"] = ""
+
+        # Шаг 3: извлекаем хэштеги
+        def extract_tags(text: str) -> list:
+            return re.findall(r"#\w+", text or "")
+
+        df["tweet_hashtags"] = df["text"].apply(extract_tags)
+
+        # Шаг 4: формируем label — склеиваем теги пробелом
+        df["label"] = df["tweet_hashtags"].apply(lambda tags: " ".join(tags))
+
+        # Шаг 5: НЕ удаляем ни одной строки — оставляем всё
+        bt.logging.info(f"Twitter preprocessing done: {len(df)} rows remain")
+
+        # Шаг 6: кодируем username и url, если они есть
+        # (Если у вас нет колонок username/url, этот блок можно опустить.)
+        if "username" in df.columns:
+            public_fernet = encoding_key_manager.get_fernet()
+            df["username_encoded"] = df["username"].apply(
+                lambda u: public_fernet.encrypt(u.encode()).decode()
+            )
+        else:
+            df["username_encoded"] = ""
+
+        if "url" in df.columns:
+            private_fernet = private_encoding_key_manager.get_fernet()
+            df["url_encoded"] = df["url"].apply(
+                lambda u: private_fernet.encrypt(u.encode()).decode()
+            )
+        else:
+            df["url_encoded"] = ""
+
+        # Оставляем только нужные колонки в нужном порядке
+        return df[["text", "tweet_hashtags", "label", "datetime", "username_encoded", "url_encoded"]]
+
     except Exception as e:
-        bt.logging.error(f"Error in Reddit preprocessing: {e}")
-        raise
+        bt.logging.error(f"Error in preprocess_twitter_df: {e}")
+        # Если что-то пошло не так, возвращаем пустой DF с правильными колонками
+        return pd.DataFrame(columns=[
+            "text", "tweet_hashtags", "label", "datetime", "username_encoded", "url_encoded"
+        ])
+
+
+# файл: huggingface_utils/utils.py
+
+import pandas as pd
+import json
+import bittensor as bt
+from huggingface_utils.encoding_system import EncodingKeyManager
+
+def preprocess_reddit_df(
+    df: pd.DataFrame,
+    encoding_key_manager: EncodingKeyManager,
+    private_encoding_key_manager: EncodingKeyManager
+) -> pd.DataFrame:
+    """
+    Приводит Reddit-данные к единому формату:
+    - datetime  — к pandas.Timestamp
+    - text      — заголовок + тело поста/комментария
+    - label     — имя сабреддита
+    - dataType  — 'post' или 'comment'
+    - communityName — название сабреддита
+    - кодировка url, username (если нужно)
+    """
+    try:
+        bt.logging.info(f"Starting Reddit preprocessing with {len(df)} rows")
+
+        # 1) Преобразуем дату
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+
+        # 2) 'content' — строка JSON, раскодируем её
+        def parse_content(x):
+            try:
+                return json.loads(x) if isinstance(x, str) else {}
+            except:
+                return {}
+
+        parsed = df["content"].apply(parse_content)
+
+        # 3) Вытащим поля: заголовок, тело, тип
+        texts = parsed.apply(lambda c: (c.get("title") or "") + 
+                                       (" " + c.get("selftext") if c.get("selftext") else ""))
+        types = parsed.apply(lambda c: c.get("dataType", ""))  # 'post' или 'comment'
+        communities = parsed.apply(lambda c: c.get("communityName", ""))
+
+        result = pd.DataFrame({
+            "text": texts,
+            "dataType": types,
+            "communityName": communities,
+            "datetime": df["datetime"]
+        })
+
+        # 4) label = имя сабреддита
+        result["label"] = result["communityName"]
+
+        bt.logging.info(f"Reddit preprocessing done: {len(result)} rows remain")
+
+        # 5) кодируем username/url, если они есть
+        if "username" in df.columns:
+            pub = encoding_key_manager.get_fernet()
+            result["username_encoded"] = df["username"].apply(
+                lambda u: pub.encrypt(u.encode()).decode() if u else ""
+            )
+        else:
+            result["username_encoded"] = ""
+
+        if "url" in df.columns:
+            priv = private_encoding_key_manager.get_fernet()
+            result["url_encoded"] = df["url"].apply(
+                lambda u: priv.encrypt(u.encode()).decode() if u else ""
+            )
+        else:
+            result["url_encoded"] = ""
+
+        # Оставляем в таком порядке
+        return result[[
+            "text", "dataType", "communityName", "label", "datetime",
+            "username_encoded", "url_encoded"
+        ]]
+
+    except Exception as e:
+        bt.logging.error(f"Error in preprocess_reddit_df: {e}")
+        # возвращаем пустую таблицу с нужными колонками
+        return pd.DataFrame(columns=[
+            "text", "dataType", "communityName", "label", "datetime",
+            "username_encoded", "url_encoded"
+        ])

@@ -1,0 +1,17 @@
+{
+  "cookies_file": "twitter_cookies.json",
+  "search_keywords": ["bitcoin", "ethereum", "bittensor", "crypto news"],
+  "tweets_per_keyword": 30,
+  "reddit": {
+    "client_id": "Km4IiLFnQzlwe7E_5mbvxQ",
+    "client_secret": "TlpYu3OWDslbMBo59ZqjKCko0Sy_DQ",
+    "user_agent": "data-universe-scraper/0.1 by Beneficial-Nebula395"
+  },
+  "search_subreddits": ["Bitcoin","Cryptocurrency","Bittensor_"],
+  "posts_per_subreddit": 30,
+  "db_path": "data_universe.db",
+  "public_key_file": "",
+  "private_key_file": "",
+  "s3_auth_url": "",
+  "state_file": "upload_state.json"
+}

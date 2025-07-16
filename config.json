@@ -1,0 +1,22 @@
+{
+  "cookies_file": "twitter_cookies.json",
+  "search_keywords": [
+    "bitcoin", "ethereum", "crypto news", "solana", "cardano",
+    "polkadot", "defi", "uniswap", "aave", "optimism",
+    "zksync", "nft", "web3", "ai crypto", "meme coin", "bittensor"
+  ],
+  "tweets_per_keyword": 20,
+  "reddit": {
+    "client_id": "Km4IiLFnQzlwe7E_5mbvxQ",
+    "client_secret": "TlpYu3OWDslbMBo59ZqjKCko0Sy_DQ",
+    "user_agent": "data-universe-scraper/0.1 by Beneficial-Nebula395"
+  },
+  "search_subreddits": [
+    "Bitcoin","ethereum","CryptoCurrency","solana","cardano",
+    "polkadot","defi","uniswap","Aave_Official","Optimism",
+    "zksync","NFT","web3","Bittensor_","CryptoTechnology"
+  ],
+  "posts_per_subreddit": 20,
+  "db_path": "data_universe.db"
+}
+

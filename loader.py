@@ -9,38 +9,48 @@ from common.data import DataEntity, DataLabel, DataSource
 
 def to_data_entity(data: dict) -> DataEntity:
     """
-    Преобразует словарь json в объект DataEntity.
+    Преобразует словарь JSON в объект DataEntity.
+    Ожидает поля:
+      - uri: str
+      - datetime: ISO-строка или datetime
+      - source: int (1=Reddit, 2=Twitter)
+      - label: Optional[str]
+      - content: str или bytes
+      - content_size_bytes: int
     """
-    if "text" in data and "created_at" in data:
-        data = {
-            "id": data["id"],
-            "timestamp": data["created_at"],
-            "content": data["text"],
-            "uri": f"https://twitter.com/i/web/status/{data['id']}",
-            "label": data.get("keyword", ""),
-            "content_size_bytes": len(data["text"].encode("utf-8")),
-            "source": 2
-        }
 
-    # 2) если это запись из реддита (скрапер отдаёт datetime, content и т.д.)
-    elif "datetime" in data:
-        # просто переименуем datetime → timestamp
-        data["timestamp"] = data.pop("datetime")
+    # 1) datetime может быть строкой — парсим
+    dt_raw = data.get("datetime")
+    if isinstance(dt_raw, str):
+        dt_obj = date_parser.parse(dt_raw)
+    elif isinstance(dt_raw, dt.datetime):
+        dt_obj = dt_raw
+    else:
+        raise ValueError(f"Поле 'datetime' должно быть str или datetime, получили {type(dt_raw)}")
 
-    # 3) в остальных случаях оставляем поля как есть,
-    #    но DataEntity по-прежнему ждёт timestamp, а не datetime
-    if "timestamp" not in data:
-        raise ValueError(f"У записи нет поля 'timestamp': {data}")
+    # 2) content может быть строкой или байтами — приводим к bytes
+    content_raw = data.get("content")
+    if isinstance(content_raw, str):
+        content_bytes = content_raw.encode("utf-8")
+    elif isinstance(content_raw, (bytes, bytearray)):
+        content_bytes = bytes(content_raw)
+    else:
+        raise ValueError(f"Поле 'content' должно быть str или bytes, получили {type(content_raw)}")
+
+    # 3) остальные поля
+    uri = data["uri"]
+    source = DataSource(data["source"])
+    label = DataLabel(value=data["label"]) if data.get("label") else None
+    size = data["content_size_bytes"]
 
     return DataEntity(
-        uri=data["id"],
-        datetime=date_parser.parse(data["timestamp"]),
-        source=DataSource.X,  # Twitter / X
-        label=DataLabel(value=f"#{data['author']}"),
-        content=data["text"].encode("utf-8"),
-        content_size_bytes=len(data["text"].encode("utf-8"))
+        uri=uri,
+        datetime=dt_obj,
+        source=source,
+        label=label,
+        content=content_bytes,
+        content_size_bytes=size
     )
-
 
 def load_entities(path: str = "scraped_data/") -> List[DataEntity]:
     """

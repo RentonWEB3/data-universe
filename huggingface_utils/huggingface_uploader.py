@@ -16,7 +16,10 @@ from huggingface_utils.utils import(
     migrate_stats_to_v2,
     get_default_stats_structure
 )
+from datasets import Dataset, DatasetDict, Features, Value, Sequence
 from huggingface_utils.encoding_system import EncodingKeyManager
+from common.data import HuggingFaceMetadata, DataSource
+from typing import List
 from huggingface_utils.s3_utils import S3Auth
 from common.data import HuggingFaceMetadata, DataSource
 from typing import List, Dict, Union, Any
@@ -236,135 +239,93 @@ class DualUploader:
         return success
 
     def upload_sql_to_huggingface(self) -> List[HuggingFaceMetadata]:
+        """
+        Читает новые записи из SQLite, сохраняет их чанками в parquet,
+        затем собирает эти чанки в единый датасет и пушит в HF.
+        После успешной загрузки удаляет локальные parquet-файлы
+        и сохраняет новое состояние (последнюю дату и общее число строк).
+        """
         if not self.hf_token:
             bt.logging.error("Hugging Face token not found. Please check your environment variables.")
             return []
 
-        if not os.path.exists(self.output_dir):
-            os.makedirs(self.output_dir)
+        # Создаём директорию для хранения parquet (если ещё нет)
+        os.makedirs(self.output_dir, exist_ok=True)
 
+        # Загружаем состояние прошлой сессии
         state = self.load_state()
-        hf_metadata_list = []
+        hf_metadata_list: List[HuggingFaceMetadata] = []
 
+        # Проходим по каждому источнику: 1 — Reddit, 2 — Twitter (X)
         for source in [DataSource.REDDIT.value, DataSource.X.value]:
             platform = 'reddit' if source == DataSource.REDDIT.value else 'x'
-
-            # Define the repository ID for each platform
-            repo_id = f"{self.hf_api.whoami(self.hf_token)['name']}/{platform}_dataset_{self.unique_id}"
-
-            # Create DatasetCardGenerator instance for each platform
-            card_generator = DatasetCardGenerator(
-                miner_hotkey=self.miner_hotkey,
-                repo_id=repo_id,
-                token=self.hf_token
-            )
-
-            try:
-                # Check if repository exists
-                self.hf_api.repo_info(repo_id=repo_id, repo_type="dataset")
-                bt.logging.info(f"Repository {repo_id} already exists.")
-                next_chunk_id = self.get_next_chunk_id(repo_id)
-            except Exception:
-                # Create new repository
-                self.hf_api.create_repo(token=self.hf_token, repo_id=repo_id.split('/')[1], private=False, repo_type="dataset")
-                bt.logging.info(f"Created new repository: {repo_id}")
-                next_chunk_id = 0
-
             last_upload = state['last_upload'].get(str(source))
             total_rows = state['total_rows'].get(str(source), 0)
-            chunk_count = 0
+            chunk_id = 0
+            parquet_paths: List[str] = []
 
-            all_stats = {}
-            new_rows = 0
+            # 1) Читаем новые данные из БД и паркетируем чанки
+            for df in self.get_data_for_huggingface_upload(source, last_upload):
+                # Пропускаем полностью пустые или без даты чанки
+                if df.empty or df['datetime'].dropna().empty:
+                    continue
 
-            s3_creds = self.s3_auth.get_credentials(
-                source_name=platform,
-                subtensor=self.subtensor,
-                wallet=self.wallet,
-            )
+                # Обновляем метку последнего времени
+                last_upload = df['datetime'].max()
 
-            try:
-                for df in self.get_data_for_huggingface_upload(source, last_upload):
-                    bt.logging.info(f"Processing new DataFrame for source {source}")
+                # Предобрабатываем (фильтрация, кодировка и т.п.)
+                df = self.preprocess_data(df, source)
 
-                    if df.empty:
-                        bt.logging.info(f"Encountered empty DataFrame for source {source}. Skipping.")
-                        continue
+                # Сохраняем в parquet
+                parquet_path = os.path.join(
+                    self.output_dir,
+                    f"train-DataEntity_chunk_{chunk_id}.parquet"
+                )
+                df.to_parquet(parquet_path, index=False)
+                parquet_paths.append(parquet_path)
 
-                    bt.logging.info(f"Current total rows: {total_rows}")
-                    if total_rows >= 200_000_000: # TODO
-                        bt.logging.info(f"Reached 200 million rows limit for source {source}. Stopping upload.")
-                        break
+                total_rows += len(df)
+                chunk_id += 1
 
-                    last_upload = df['datetime'].max()
+            # 2) Если ни одного parquet-файла нет — пропускаем загрузку для этого источника
+            if not parquet_paths:
+                bt.logging.warning(f"No new parquet chunks for {platform}, skipping upload")
+                continue
 
-                    bt.logging.info(f"Starting preprocessing for DataFrame with {len(df)} rows")
-                    df = self.preprocess_data(df, source)
-                    rows_to_upload = min(len(df), 400_000_000 - total_rows)
+            # 3) Собираем все чанки в один DataFrame и пушим на Hugging Face
+            import pandas as pd
+            from datasets import Dataset
 
-                    if rows_to_upload < len(df):
-                        df = df.iloc[:rows_to_upload]  # Trim the dataframe if necessary
+            bt.logging.info(f"Loading {len(parquet_paths)} parquet chunks for {platform}")
+            all_dfs = [pd.read_parquet(p) for p in parquet_paths]
+            full_df = pd.concat(all_dfs, ignore_index=True)
 
-                    parquet_path = os.path.join(self.output_dir,
-                                                f"train-DataEntity_chunk_{next_chunk_id + chunk_count}.parquet")
-                    df.to_parquet(parquet_path, index=False)
+            # Конвертируем в HF-dataset и пушим
+            ds = Dataset.from_pandas(full_df)
+            repo_id = f"{self.hf_api.whoami(self.hf_token)['name']}/{platform}_dataset_{self.unique_id}"
+            bt.logging.info(f"Pushing dataset to {repo_id}")
+            ds.push_to_hub(repo_id=repo_id, token=self.hf_token, private=False)
 
-                    bt.logging.info(f"Saving chunk to Parquet file: {parquet_path}")
+            # 4) Удаляем локальные parquet-файлы
+            for p in parquet_paths:
+                os.remove(p)
 
-                    bt.logging.info("Collecting statistics for the current chunk")
-                    chunk_stats = self.collect_statistics(df, source)
-                    all_stats = self.merge_statistics(all_stats, chunk_stats)
+            # 5) Обновляем и сохраняем состояние
+            state['last_upload'][str(source)] = last_upload
+            state['total_rows'][str(source)] = total_rows
+            self.save_state(state)
 
-                    chunk_count += 1
-                    total_rows += len(df)
-                    new_rows += len(df)
-
-                    if chunk_count == 10:
-                        self.upload_parquet_to_hf(repo_id, s3_creds)
-                        bt.logging.info(f'Uploaded {chunk_count} chunks to {repo_id}')
-                        next_chunk_id += chunk_count
-                        chunk_count = 0
-                        with self.get_db_connection() as conn:
-                            self.manage_wal(conn)
-
-                if chunk_count > 0:
-                    self.upload_parquet_to_hf(repo_id, s3_creds)
-                    with self.get_db_connection() as conn:
-                        self.manage_wal(conn)
-                    bt.logging.info(f'Uploaded final {chunk_count} chunks to {repo_id}')
-
-                state['last_upload'][str(source)] = last_upload
-                state['total_rows'][str(source)] = total_rows
-                self.save_state(state)
-
-                if new_rows > 0:
-                    # Update stats
-                    updated_stats = self.save_stats_json(all_stats, platform, new_rows, repo_id)
-
-                    # Update README and save stats.json
-                    update_history = updated_stats['summary']['update_history']
-                    cumulative_total = 0
-                    formatted_history = []
-                    for item in update_history:
-                        cumulative_total += item['count']
-                        formatted_history.append((item['timestamp'], item['count'], cumulative_total))
-
-                    card_generator.update_or_create_card(updated_stats, formatted_history)
-
-                # Save metadata
-                hf_metadata = HuggingFaceMetadata(
+            # 6) Заполняем метаданные для возврата
+            hf_metadata_list.append(
+                HuggingFaceMetadata(
                     repo_name=repo_id,
                     source=source,
                     updated_at=dt.datetime.utcnow(),
-                    encoding_key=self.encoding_key_manager.sym_key.decode()  # Use sym_key and decode it to string
+                    encoding_key=self.encoding_key_manager.sym_key.decode()
                 )
-                hf_metadata_list.append(hf_metadata)
+            )
 
-                bt.logging.success(
-                    f"Finished uploading data for source {source} to {repo_id}. Total rows uploaded: {total_rows}")
-
-            except Exception as e:
-                bt.logging.error(f"Error during upload for source {source}: {e}")
+            bt.logging.success(f"Finished uploading {platform} data: total_rows={total_rows}")
 
         return hf_metadata_list
 

@@ -1,0 +1,47 @@
+import asyncio
+import json
+from twikit_scraper import scrape_twitter
+from reddit_scraper import scrape_reddit
+from huggingface_utils.huggingface_uploader import DualUploader
+import bittensor as bt
+from huggingface_utils.encoding_system import EncodingKeyManager
+from huggingface_utils.s3_utils import S3Auth
+
+async def main():
+    print("=== Запуск пайплайна ===")
+    # 1) Twitter
+    await scrape_twitter()  # source=2
+    # 2) Reddit
+    new_reddit = scrape_reddit()  # source=1 (это синхр. функция)
+    print(f"Добавлено новых Reddit-записей: {new_reddit}")
+
+    # 3) Конфиг для HF
+    cfg = json.load(open("config.json", "r", encoding="utf-8"))
+    db_path = cfg["db_path"]
+    s3_url = cfg.get("s3_auth_url", "")
+    state_file = cfg.get("state_file", "upload_state.json")
+    # Инициализация Bittensor объектов
+    subtensor = bt.subtensor()
+    wallet = bt.wallet()
+    # Ключи для кодирования
+    enc_mgr = EncodingKeyManager(cfg.get("public_key_file",""), cfg.get("private_key_file",""))
+    s3_auth = S3Auth(s3_url) if s3_url else None
+
+    uploader = DualUploader(
+        db_path=db_path,
+        subtensor=subtensor,
+        wallet=wallet,
+        encoding_key_manager=enc_mgr,
+        private_encoding_key_manager=enc_mgr,
+        s3_auth_url=s3_url,
+        state_file=state_file
+    )
+
+    # 4) Загрузка обеих платформ
+    metadata = uploader.upload_sql_to_huggingface()
+    print("=== Загрузка на HF завершена. Метаданные: ===")
+    for m in metadata:
+        print(m)
+
+if __name__ == "__main__":
+    asyncio.run(main())
