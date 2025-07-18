@@ -49,6 +49,33 @@ def main():
     df.to_parquet(parquet_path)
     print(f"📦 Паркет сохранён: {parquet_path}")
 
+    # 🪣 Генерация MinerIndex
+    try:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df = df.dropna(subset=["datetime", "label", "source"])
+        df["date"] = df["datetime"].dt.date
+
+        grouped = df.groupby(["source", "label", "date"])
+
+        buckets = []
+        for (source, label, date), group in grouped:
+            start = datetime.combine(date, datetime.min.time())
+            end = start + pd.Timedelta(days=1)
+            bucket = {
+                "source": str(source).lower(),
+                "label": str(label),
+                "start_time": start.isoformat() + "Z",
+                "end_time": end.isoformat() + "Z"
+            }
+            buckets.append(bucket)
+
+        index = {"buckets": buckets}
+        with open("miner_index.json", "w", encoding="utf-8") as f:
+            json.dump(index, f, ensure_ascii=False, indent=2)
+        print(f"🧠 MinerIndex сохранён → miner_index.json")
+    except Exception as e:
+        print(f"❌ Ошибка генерации MinerIndex: {e}")
+
     ds = Dataset.from_pandas(df)
     dsdict = DatasetDict({"train": ds})
 

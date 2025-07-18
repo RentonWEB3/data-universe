@@ -4,7 +4,7 @@ import subprocess
 from datetime import datetime
 
 # Вставь свой HF_TOKEN сюда
-HF_TOKEN ="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"
+HF_TOKEN ="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"
 
 def log(msg):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

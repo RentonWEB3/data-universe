@@ -8,15 +8,19 @@ from scraping.x.microworlds_scraper import MicroworldsTwitterScraper
 from scraping.x.apidojo_scraper import ApiDojoTwitterScraper
 from scraping.x.quacker_url_scraper import QuackerUrlScraper
 from scraping.youtube.youtube_custom_scraper import YouTubeTranscriptScraper
+from scraping.custom_scrapers import CustomTwitterScraper, CustomRedditScraper
 
 
 DEFAULT_FACTORIES = {
-    ScraperId.REDDIT_LITE: RedditLiteScraper,
-    # For backwards compatibility with old configs, remap x.flash to x.apidojo.
-    ScraperId.X_FLASH: MicroworldsTwitterScraper,
-    ScraperId.REDDIT_CUSTOM: RedditCustomScraper,
-    ScraperId.X_MICROWORLDS: MicroworldsTwitterScraper,
+    # Заменяем RedditLite на ваш кастомный
+    ScraperId.REDDIT_LITE: CustomRedditScraper,
+    ScraperId.REDDIT_CUSTOM: CustomRedditScraper,
+    # Для Twitter добавляем X_CUSTOM
+    ScraperId.X_CUSTOM: CustomTwitterScraper,
+    # Сохраняем старые пути для других скраперов
     ScraperId.X_APIDOJO: ApiDojoTwitterScraper,
+    ScraperId.X_FLASH: MicroworldsTwitterScraper,
+    ScraperId.X_MICROWORLDS: MicroworldsTwitterScraper,
     ScraperId.X_QUACKER: QuackerUrlScraper,
     ScraperId.YOUTUBE_TRANSCRIPT: YouTubeTranscriptScraper
 }
@@ -32,6 +36,12 @@ class ScraperProvider:
 
     def get(self, scraper_id: ScraperId) -> Scraper:
         """Returns a scraper for the given scraper id."""
+        if scraper_id == ScraperId.X_CUSTOM:
+            from scraping.custom_scrapers import CustomTwitterScraper
+            return CustomTwitterScraper()
+        if scraper_id == ScraperId.REDDIT_CUSTOM:
+            from scraping.custom_scrapers import CustomRedditScraper
+            return CustomRedditScraper()
 
         assert scraper_id in self.factories, f"Scraper id {scraper_id} not supported."
 

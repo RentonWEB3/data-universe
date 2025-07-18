@@ -13,6 +13,7 @@ from common.data import DataLabel, DataSource, StrictBaseModel, TimeBucket
 from scraping.provider import ScraperProvider
 from scraping.scraper import ScrapeConfig, ScraperId
 from storage.miner.miner_storage import MinerStorage
+from storage.miner.sqlite_miner_storage import SqliteMinerStorage
 
 
 class LabelScrapingConfig(StrictBaseModel):
@@ -151,16 +152,22 @@ class ScraperCoordinator:
     class Tracker:
         """Tracks scrape runs for the coordinator."""
 
-        def __init__(self, config: CoordinatorConfig, now: dt.datetime):
-            self.cadence_by_scraper_id = {
-                scraper_id: dt.timedelta(seconds=cfg.cadence_seconds)
-                for scraper_id, cfg in config.scraper_configs.items()
-            }
+        def __init__(
+            self,
+            scraper_provider,    # ScrapProvider instance
+            miner_storage,       # SqliteMinerStorage instance
+            config               # your ScrapingConfig object
+        ):
+            # Сохраняем провайдер, конфиг и хранилище
+            self.provider      = scraper_provider
+            self.config        = config
+            self.miner_storage = miner_storage
 
-            # Initialize the last scrape time as now, to protect against frequent scraping during Miner crash loops.
-            self.last_scrape_time_per_scraper_id: Dict[ScraperId, dt.datetime] = {
-                scraper_id: now for scraper_id in config.scraper_configs.keys()
-            }
+            # Остальные ваши поля:
+            self.max_workers = getattr(config, 'max_workers', 4)
+            self.tracker     = Tracker(config, now=dt.datetime.utcnow())
+            self.should_exit = False
+            self.queue = None
 
         def get_scraper_ids_ready_to_scrape(self, now: dt.datetime) -> List[ScraperId]:
             """Returns a list of ScraperIds which are due to run."""
@@ -177,20 +184,6 @@ class ScraperCoordinator:
             """Notifies the tracker that a scrape has been scheduled."""
             self.last_scrape_time_per_scraper_id[scraper_id] = now
 
-    def __init__(
-        self,
-        scraper_provider: ScraperProvider,
-        miner_storage: MinerStorage,
-        config: CoordinatorConfig,
-    ):
-        self.provider = scraper_provider
-        self.storage = miner_storage
-        self.config = config
-
-        self.tracker = ScraperCoordinator.Tracker(self.config, dt.datetime.utcnow())
-        self.max_workers = 5
-        self.is_running = False
-        self.queue = asyncio.Queue()
 
     def run_in_background_thread(self):
         """
@@ -211,56 +204,51 @@ class ScraperCoordinator:
         bt.logging.info("Stopping the ScrapingCoordinator.")
         self.is_running = False
 
-    async def _start(self):
-        workers = []
-        for i in range(self.max_workers):
-            worker = asyncio.create_task(
-                self._worker(
-                    f"worker-{i}",
-                )
-            )
-            workers.append(worker)
+import asyncio
+import functools
+import datetime as dt
+import traceback
+import bittensor as bt
 
-        while self.is_running:
+class ScraperCoordinator:
+    # … ваш конструктор, где вы уже сохранили self.miner_storage и self.config, self.provider …
+
+    async def _start(self):
+        self.queue = asyncio.Queue()
+        workers = [asyncio.create_task(self._worker(f"worker-{i}")) for i in range(self.max_workers)]
+        self.is_running = True
+
+        while self.is_running and not self.should_exit:
             now = dt.datetime.utcnow()
-            scraper_ids_to_scrape_now = self.tracker.get_scraper_ids_ready_to_scrape(
-                now
-            )
-            if not scraper_ids_to_scrape_now:
-                bt.logging.trace("Nothing ready to scrape yet. Trying again in 15s.")
-                # Nothing is due a scrape. Wait a few seconds and try again
+            ids = self.tracker.get_scraper_ids_ready_to_scrape(now)
+            if not ids:
                 await asyncio.sleep(15)
                 continue
-
-            for scraper_id in scraper_ids_to_scrape_now:
+            for scraper_id in ids:
                 scraper = self.provider.get(scraper_id)
-
-                scrape_configs = _choose_scrape_configs(scraper_id, self.config, now)
-
-                for config in scrape_configs:
-                    # Use .partial here to make sure the functions arguments are copied/stored
-                    # now rather than being lazily evaluated (if a lambda was used).
-                    # https://pylint.readthedocs.io/en/latest/user_guide/messages/warning/cell-var-from-loop.html#cell-var-from-loop-w0640
-                    bt.logging.trace(f"Adding scrape task for {scraper_id}: {config}.")
-                    self.queue.put_nowait(functools.partial(scraper.scrape, config))
-
+                configs = _choose_scrape_configs(scraper_id, self.config, now)
+                for cfg in configs:
+                    self.queue.put_nowait(functools.partial(scraper.scrape, cfg))
                 self.tracker.on_scrape_scheduled(scraper_id, now)
 
-        bt.logging.info("Coordinator shutting down. Waiting for workers to finish.")
-        await asyncio.gather(*workers)
+        await self.queue.join()
+        for w in workers:
+            w.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
         bt.logging.info("Coordinator stopped.")
 
-    async def _worker(self, name):
-        """A worker thread"""
-        while self.is_running:
+    async def _worker(self, name: str):
+        bt.logging.info(f"{name} started.")
+        while not self.should_exit:
             try:
-                # Wait for a scraping task to be added to the queue.
-                scrape_fn = await self.queue.get()
-
-                # Perform the scrape
-                data_entities = await scrape_fn()
-
-                self.storage.store_data_entities(data_entities)
-                self.queue.task_done()
+                task = await self.queue.get()
+                entities = await task()
+                self.miner_storage.store_data_entities(entities)
+                bt.logging.info(f"{name}: Stored {len(entities)} entities.")
             except Exception as e:
-                bt.logging.error("Worker " + name + ": " + traceback.format_exc())
+                bt.logging.error(f"{name} error: {e}")
+                bt.logging.debug(traceback.format_exc())
+            finally:
+                self.queue.task_done()
+        bt.logging.info(f"{name} exiting.")
+

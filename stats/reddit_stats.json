@@ -1,0 +1,17 @@
+{
+  "data_source": "reddit",
+  "summary": {
+    "total_rows": 280,
+    "start_dt": "2025-07-15",
+    "end_dt": "2025-07-16",
+    "last_update_dt": "2025-07-16"
+  },
+  "metadata": {
+    "posts_percentage": 72.5,
+    "comments_percentage": 27.5
+  },
+  "topics": [
+    { "topic_type": "subreddit", "topic": "CryptoCurrency", "total_count": 100, "total_percentage": 35.7 },
+    { "topic_type": "subreddit", "topic": "Bitcoin", "total_count": 60, "total_percentage": 21.4 }
+  ]
+}

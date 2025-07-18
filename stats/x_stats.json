@@ -1,0 +1,16 @@
+{
+  "data_source": "x",
+  "summary": {
+    "total_rows": 233,
+    "start_dt": "2025-07-15",
+    "end_dt": "2025-07-16",
+    "last_update_dt": "2025-07-16"
+  },
+  "metadata": {
+    "tweets_with_hashtags_percentage": 60.0
+  },
+  "topics": [
+    { "topic_type": "hashtag", "topic": "#crypto", "total_count": 80, "total_percentage": 34.3 },
+    { "topic_type": "hashtag", "topic": "#btc", "total_count": 50, "total_percentage": 21.5 }
+  ]
+}

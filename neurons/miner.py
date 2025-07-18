@@ -151,17 +151,47 @@ class Miner:
 
         bt.logging.info("Initialized EncodingKeyManager for URL encoding/decoding.")
 
+        # … код выше в __init__ …
+
+        # Подключаем Hugging Face-аплоадеры
         if self.use_hf_uploader:
-            self.hf_uploader = DualUploader(
+            # Жёстко задаём имя state-файла для Twitter
+            twitter_state = 'twitter_state.json'
+            # Создаём аплоадер для Twitter
+            self.twitter_uploader = DualUploader(
                 db_path=self.config.neuron.database_name,
+                subtensor=self.subtensor,
+                wallet=self.wallet,
                 encoding_key_manager=self.encoding_key_manager,
                 private_encoding_key_manager=self.private_encoding_key_manager,
-                wallet=self.wallet,
-                subtensor=self.subtensor,
-                state_file=self.config.miner_upload_state_file,
                 s3_auth_url=self.config.s3_auth_url,
-
+                state_file=twitter_state,
+                output_dir='hf_storage',
+                chunk_size=1_000_000,
+                repo_name=self.config.huggingface_twitter_repo
             )
+
+            # Жёстко задаём имя state-файла для Reddit
+            reddit_state = 'reddit_state.json'
+            # Создаём аплоадер для Reddit
+            self.reddit_uploader = DualUploader(
+                db_path=self.config.neuron.database_name,
+                subtensor=self.subtensor,
+                wallet=self.wallet,
+                encoding_key_manager=self.encoding_key_manager,
+                private_encoding_key_manager=self.private_encoding_key_manager,
+                s3_auth_url=self.config.s3_auth_url,
+                state_file=reddit_state,
+                output_dir='hf_storage',
+                chunk_size=1_000_000,
+                repo_name=self.config.huggingface_reddit_repo
+            )
+
+            # Для кода, где ещё может использоваться старый атрибут
+            self.hf_uploader = self.twitter_uploader
+
+        # … остальной код __init__ …
+
 
         # Instantiate storage.
         self.storage = SqliteMinerStorage(
@@ -252,23 +282,30 @@ class Miner:
         if not self.use_hf_uploader:
             bt.logging.info("HuggingFace Uploader is not enabled.")
             return
-
-        time_sleep_val = dt.timedelta(minutes=30).total_seconds()
-        time.sleep(time_sleep_val)
-
+        # Ждём 30 минут после старта
+        time.sleep(30 * 60)
         while not self.should_exit:
-            try:
-                unique_id = self.hf_uploader.unique_id  # Assuming this exists in the DualUploader
-                if self.storage.should_upload_hf_data(unique_id):
-                    bt.logging.info("Trying to upload the data into HuggingFace and S3.")
-                    hf_metadata_list = self.hf_uploader.upload_sql_to_huggingface()
-                    if hf_metadata_list:
-                        self.storage.store_hf_dataset_info(hf_metadata_list)
-            except Exception:
-                bt.logging.error(traceback.format_exc())
+            # — Twitter —
+            if self.twitter_uploader.storage.should_upload_hf_data(self.twitter_uploader.unique_id):
+                bt.logging.info("Uploading Twitter data to Hugging Face")
+                meta = self.twitter_uploader.upload_sql_to_huggingface(
+                    description=self.config.huggingface_twitter_description,
+                    license=self.config.huggingface_license
+                )
+                if meta:
+                    self.storage.store_hf_dataset_info(meta)
+            # — Reddit —
+            if self.reddit_uploader.storage.should_upload_hf_data(self.reddit_uploader.unique_id):
+                bt.logging.info("Uploading Reddit data to Hugging Face")
+                meta = self.reddit_uploader.upload_sql_to_huggingface(
+                    description=self.config.huggingface_reddit_description,
+                    license=self.config.huggingface_license
+                )
+                if meta:
+                    self.storage.store_hf_dataset_info(meta)
+            # Ждём следующий цикл (90 минут)
+            time.sleep(90 * 60)
 
-            time_sleep_val = dt.timedelta(minutes=90).total_seconds()
-            time.sleep(time_sleep_val)
     def run(self):
         """
         Initiates and manages the main loop for the miner.
@@ -534,116 +571,33 @@ class Miner:
         return self.default_priority(synapse)
 
     async def handle_on_demand(self, synapse: OnDemandRequest) -> OnDemandRequest:
-        """
-        Handle on-demand data requests from validators.
-        Uses enhanced scraper for X data while maintaining protocol compatibility.
-        """
         bt.logging.info(f"Got on-demand request from {synapse.dendrite.hotkey}")
-
         try:
-            # Get appropriate scraper from provider
-            scraper_id = None
-            if synapse.source == DataSource.X:
-                scraper_id = ScraperId.X_APIDOJO
-                # For X, combine keywords and usernames with appropriate label formatting
-                labels = []
-                if synapse.keywords:
-                    labels.extend([DataLabel(value=k) for k in synapse.keywords])
-                if synapse.usernames:
-                    # Ensure usernames have @ prefix
-                    labels.extend([DataLabel(value=f"@{u.strip('@')}" if not u.startswith('@') else u) for u in
-                                   synapse.usernames])
+            from scraping.provider import ScraperProvider
+            from scraping.scraper import ScraperId
 
+            # выбираем нужный скрайпер
+            if synapse.source == DataSource.X:
+                scraper_id = ScraperId.X_CUSTOM
             elif synapse.source == DataSource.REDDIT:
                 scraper_id = ScraperId.REDDIT_CUSTOM
-                # For Reddit, ensure subreddit has r/ prefix
-                if synapse.keywords and len(synapse.keywords) > 0:
-                    subreddit = synapse.keywords[0]
-                    if not subreddit.startswith('r/'):
-                        subreddit = f"r/{subreddit}"
-                    labels = [DataLabel(value=subreddit)]
-                else:
-                    labels = []
-
-            if not scraper_id:
-                bt.logging.error(f"No scraper ID for source {synapse.source}")
+            else:
                 synapse.data = []
                 return synapse
 
-            # Create date range
-            start_dt = (dt.datetime.fromisoformat(synapse.start_date)
-                        if synapse.start_date else dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1))
-            end_dt = (dt.datetime.fromisoformat(synapse.end_date)
-                      if synapse.end_date else dt.datetime.now(dt.timezone.utc))
+            # создаём самый простой конфиг
+            config = ScrapeConfig(entity_limit=synapse.limit)
 
-            # Log the labels being used
-            bt.logging.info(f"Searching with labels: {[l.value for l in labels]}")
-
-            config = ScrapeConfig(
-                entity_limit=synapse.limit,
-                date_range=DateRange(
-                    start=start_dt,
-                    end=end_dt
-                ),
-                labels=labels,
-            )
-
-            # For X source, use the enhanced scraper directly
-            if synapse.source == DataSource.X:
-                # Initialize the enhanced scraper directly instead of using the provider
-
-                enhanced_scraper = EnhancedApiDojoTwitterScraper()
-                await enhanced_scraper.scrape(config)
-
-                # Get enhanced content
-                enhanced_content = enhanced_scraper.get_enhanced_content()
-
-                # IMPORTANT: Convert EnhancedXContent to DataEntity to maintain protocol compatibility
-                # while keeping the rich data in serialized form
-                enhanced_data_entities = []
-                for content in enhanced_content:
-                    # Convert to DataEntity but store full rich content in serialized form
-                    api_response = content.to_api_response()
-                    data_entity = DataEntity(
-                        uri=content.url,
-                        datetime=content.timestamp,
-                        source=DataSource.X,
-                        label=DataLabel(value=content.tweet_hashtags[0].lower()) if content.tweet_hashtags else None,
-                        # Store the full enhanced content as serialized JSON in the content field
-                        content=json.dumps(api_response).encode('utf-8'),
-                        content_size_bytes=len(json.dumps(api_response))
-                    )
-                    enhanced_data_entities.append(data_entity)
-
-                # Update response with enhanced data entities
-                synapse.data = enhanced_data_entities[:synapse.limit] if synapse.limit else enhanced_data_entities
-            else:
-                # For Reddit, use the provider that's part of the coordinator
-                from scraping.provider import ScraperProvider
-
-                # Create a new scraper provider and get the appropriate scraper
-                provider = ScraperProvider()
-                scraper = provider.get(scraper_id)
-
-                if not scraper:
-                    bt.logging.error(f"No scraper available for ID {scraper_id}")
-                    synapse.data = []
-                    return synapse
-
-                data = await scraper.scrape(config)
-                synapse.data = data[:synapse.limit] if synapse.limit else data
+            # запускаем скрайпер и берём N элементов
+            scraper = ScraperProvider().get(scraper_id)
+            data_entities = await scraper.scrape(config)
+            synapse.data = data_entities[:synapse.limit] if synapse.limit else data_entities
 
             synapse.version = constants.PROTOCOL_VERSION
-
-            bt.logging.success(
-                f"Returning {len(synapse.data)} items to {synapse.dendrite.hotkey}"
-            )
-
+            bt.logging.success(f"Returning {len(synapse.data)} items")
         except Exception as e:
-            bt.logging.error(f"Error in on-demand request: {str(e)}")
-            bt.logging.debug(traceback.format_exc())
+            bt.logging.error(f"Error in on-demand: {e}")
             synapse.data = []
-
         return synapse
 
     async def handle_on_demand_blacklist(

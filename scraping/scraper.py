@@ -1,5 +1,5 @@
 import abc
-from enum import Enum
+from enum import Enum, auto
 from typing import Dict, List, Optional
 from pydantic import BaseModel, Field, PositiveInt, ConfigDict
 
@@ -16,6 +16,7 @@ class ScraperId(str, Enum):
     REDDIT_CUSTOM = "Reddit.custom"
     X_MICROWORLDS = "X.microworlds"
     X_APIDOJO = "X.apidojo"
+    X_CUSTOM = "X.custom"
     X_QUACKER = "X.quacker"
     YOUTUBE_TRANSCRIPT = "YouTube.transcript"
 

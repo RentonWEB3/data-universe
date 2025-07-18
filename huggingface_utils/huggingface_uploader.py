@@ -58,7 +58,8 @@ class DualUploader:
                  s3_auth_url: str,  # For the getting upload credentials.
                  state_file: str,
                  output_dir: str = 'hf_storage',
-                 chunk_size: int = 1_000_000):
+                 chunk_size: int = 1_000_000,
+                 repo_name: str = None):
         self.db_path = db_path
         self.wallet = wallet
         self.miner_hotkey = self.wallet.hotkey.ss58_address
@@ -73,6 +74,7 @@ class DualUploader:
         self.chunk_size = chunk_size
         self.s3_auth = S3Auth(s3_auth_url) if s3_auth_url else None
         self.wal_size_limit_mb = 2000  # 2 GB WAL size limit
+        self.repo_name = repo_name
 
     @contextmanager
     def get_db_connection(self):
@@ -302,9 +304,12 @@ class DualUploader:
 
             # Конвертируем в HF-dataset и пушим
             ds = Dataset.from_pandas(full_df)
-            repo_id = f"{self.hf_api.whoami(self.hf_token)['name']}/{platform}_dataset_{self.unique_id}"
-            bt.logging.info(f"Pushing dataset to {repo_id}")
-            ds.push_to_hub(repo_id=repo_id, token=self.hf_token, private=False)
+            if self.repo_name:
+                repo_id = self.repo_name
+            else:
+                repo_id = f"{self.hf_api.whoami(self.hf_token)['name']}/{platform}_dataset_{self.unique_id}"
+                bt.logging.info(f"Pushing dataset to {repo_id}")
+                ds.push_to_hub(repo_id=repo_id, token=self.hf_token, private=False)
 
             # 4) Удаляем локальные parquet-файлы
             for p in parquet_paths:
