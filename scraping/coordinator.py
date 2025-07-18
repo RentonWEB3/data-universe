@@ -149,25 +149,62 @@ def _choose_scrape_configs(
 class ScraperCoordinator:
     """Coordinates all the scrapers necessary based on the specified target ScrapingDistribution."""
 
+    def __init__(
+        self,
+        scraper_provider,
+        miner_storage,
+        scraping_config,
+    ):
+        """
+        scraper_provider: провайдер скрайперов (ScraperProvider)
+        miner_storage: хранилище DataEntity (MinerStorage)
+        scraping_config: словарь расписания из scraping_config.json
+        """
+        self.provider = scraper_provider
+        self.storage = miner_storage
+        self.config = scraping_config
+
+        # Tracker отвечает за очередность задач
+        now = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+        self.tracker = ScraperCoordinator.Tracker(self.config, now)
+
+        # Максимум потоков для параллельного запуска
+        self.max_workers = 5
+
+        # Флаг работы
+        self.should_stop = False
+
+        # Очередь для задач
+        self.queue = asyncio.Queue()
+
+
     class Tracker:
         """Tracks scrape runs for the coordinator."""
 
         def __init__(
             self,
-            scraper_provider,    # ScrapProvider instance
-            miner_storage,       # SqliteMinerStorage instance
-            config               # your ScrapingConfig object
+            config: CoordinatorConfig,
+            now: dt.datetime,
         ):
-            # Сохраняем провайдер, конфиг и хранилище
-            self.provider      = scraper_provider
-            self.config        = config
-            self.miner_storage = miner_storage
+            """
+            config: конфигурация расписания из CoordinatorConfig
+            now: текущее время в UTC (для инициализации трекера)
+            """
+            # Сохраняем конфиг
+            self.config = config
 
-            # Остальные ваши поля:
-            self.max_workers = getattr(config, 'max_workers', 4)
-            self.tracker     = Tracker(config, now=dt.datetime.utcnow())
-            self.should_exit = False
-            self.queue = None
+            # Словарь: scraper_id -> интервал запуска (в секундах)
+            self.cadence_by_scraper_id = {
+                job.scraper_id: job.cadence_seconds
+                for job in config.scraping_jobs
+            }
+
+            # Словарь: scraper_id -> время последнего запуска
+            # Инициализируем так, чтобы все скрайперы были готовы при первом опросе
+            self.last_scrape_time_per_scraper = {
+                scraper_id: None
+                for scraper_id in self.cadence_by_scraper_id
+            }
 
         def get_scraper_ids_ready_to_scrape(self, now: dt.datetime) -> List[ScraperId]:
             """Returns a list of ScraperIds which are due to run."""

@@ -20,11 +20,12 @@
   "db_path": "data_universe.db",
 
   "huggingface": true,
+  "huggingface_token": "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",
+  "huggingface_state_file": "hf_state.json",
   "huggingface_twitter_repo": "RentonWEB3/crypto-tweets",
-  "huggingface_reddit_repo":  "RentonWEB3/crypto-reddit",
-  "huggingface_twitter_description": "Crypto Twitter stream for Subnet 13 miner. Keywords: bitcoin, defi, nft, web3, …",
-  "huggingface_reddit_description":  "Crypto Reddit posts for Subnet 13 miner. Subreddits: Bitcoin, CryptoCurrency, …",
-  "huggingface_license": "apache-2.0",
-  "twitter_upload_state_file": "twitter_upload_state.json",
-  "reddit_upload_state_file":  "reddit_upload_state.json"
+  "huggingface_reddit_repo": "RentonWEB3/crypto-reddit",
+  "huggingface_description": "Subnet-13 data (Twitter + Reddit)",
+  "huggingface_license": "mit",
+  "huggingface_initial_delay_seconds": 10,
+  "huggingface_interval_seconds": 30
 }

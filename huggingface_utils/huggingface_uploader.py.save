@@ -16,7 +16,6 @@ from huggingface_utils.utils import(
     migrate_stats_to_v2,
     get_default_stats_structure
 )
-from bittensor import Subtensor
 from datasets import Dataset, DatasetDict, Features, Value, Sequence
 from huggingface_utils.encoding_system import EncodingKeyManager
 from common.data import HuggingFaceMetadata, DataSource
@@ -51,7 +50,7 @@ class DualUploader:
         self,
         db_path: str,
         subtensor: Subtensor,
-        wallet,
+        wallet: Wallet,
         encoding_key_manager,
         private_encoding_key_manager,
         s3_auth_url: str,
@@ -243,108 +242,99 @@ class DualUploader:
 
         return success
 
-def upload_sql_to_huggingface(
-    self,
-    description: str = None,
-    license: str = None
-) -> List[HuggingFaceMetadata]:
-    """
-    Читает новые записи из SQLite, сохраняет их чанками в parquet,
-    затем собирает эти чанки в единый датасет и пушит в Hugging Face
-    (по отдельности для Reddit и для Twitter).
-    После успешной загрузки удаляет локальные parquet-файлы и
-    сохраняет новое состояние (последнюю дату и общее число строк).
-    """
-    if not self.hf_token:
-        bt.logging.error(
-            "Hugging Face token not found. Please check your environment variables."
-        )
-        return []
+    def upload_sql_to_huggingface(self) -> List[HuggingFaceMetadata]:
+        """
+        Читает новые записи из SQLite, сохраняет их чанками в parquet,
+        затем собирает эти чанки в единый датасет и пушит в HF.
+        После успешной загрузки удаляет локальные parquet-файлы
+        и сохраняет новое состояние (последнюю дату и общее число строк).
+        """
+        if not self.hf_token:
+            bt.logging.error("Hugging Face token not found. Please check your environment variables.")
+            return []
 
-    # Создаём директорию для хранения parquet (если ещё нет)
-    os.makedirs(self.output_dir, exist_ok=True)
+        # Создаём директорию для хранения parquet (если ещё нет)
+        os.makedirs(self.output_dir, exist_ok=True)
 
-    # Загружаем состояние прошлой сессии
-    state = self.load_state()
-    hf_metadata_list: List[HuggingFaceMetadata] = []
+        # Загружаем состояние прошлой сессии
+        state = self.load_state()
+        hf_metadata_list: List[HuggingFaceMetadata] = []
 
-    # Обрабатываем оба источника: 1 — Reddit, 2 — Twitter (X)
-    for source in [DataSource.REDDIT.value, DataSource.X.value]:
-        platform = 'reddit' if source == DataSource.REDDIT.value else 'x'
-        last_upload = state['last_upload'].get(str(source))
-        total_rows = state['total_rows'].get(str(source), 0)
+        # Проходим по каждому источнику: 1 — Reddit, 2 — Twitter (X)
+        for source in [DataSource.REDDIT.value, DataSource.X.value]:
+            platform = 'reddit' if source == DataSource.REDDIT.value else 'x'
+            last_upload = state['last_upload'].get(str(source))
+            total_rows = state['total_rows'].get(str(source), 0)
+            chunk_id = 0
+            parquet_paths: List[str] = []
 
-        # 1) Читаем новые данные из БД и разбиваем на чанки
-        chunk_id = 0
-        parquet_paths: List[str] = []
-        for df in self.get_data_for_huggingface_upload(source, last_upload):
-            if df.empty or df['datetime'].dropna().empty:
+            # 1) Читаем новые данные из БД и паркетируем чанки
+            for df in self.get_data_for_huggingface_upload(source, last_upload):
+                # Пропускаем полностью пустые или без даты чанки
+                if df.empty or df['datetime'].dropna().empty:
+                    continue
+
+                # Обновляем метку последнего времени
+                last_upload = df['datetime'].max()
+
+                # Предобрабатываем (фильтрация, кодировка и т.п.)
+                df = self.preprocess_data(df, source)
+
+                # Сохраняем в parquet
+                parquet_path = os.path.join(
+                    self.output_dir,
+                    f"train-DataEntity_chunk_{chunk_id}.parquet"
+                )
+                df.to_parquet(parquet_path, index=False)
+                parquet_paths.append(parquet_path)
+
+                total_rows += len(df)
+                chunk_id += 1
+
+            # 2) Если ни одного parquet-файла нет — пропускаем загрузку для этого источника
+            if not parquet_paths:
+                bt.logging.warning(f"No new parquet chunks for {platform}, skipping upload")
                 continue
 
-            # Обновляем метку последнего времени
-            last_upload = df['datetime'].max()
+            # 3) Собираем все чанки в один DataFrame и пушим на Hugging Face
+            import pandas as pd
+            from datasets import Dataset
 
-            # Предобрабатываем (фильтрация, кодировка и т.п.)
-            df = self.preprocess_data(df, source)
+            bt.logging.info(f"Loading {len(parquet_paths)} parquet chunks for {platform}")
+            all_dfs = [pd.read_parquet(p) for p in parquet_paths]
+            full_df = pd.concat(all_dfs, ignore_index=True)
 
-            # Сохраняем чанк в parquet
-            parquet_path = os.path.join(
-                self.output_dir,
-                f"train-DataEntity_chunk_{chunk_id}.parquet"
+            # Конвертируем в HF-dataset и пушим
+            ds = Dataset.from_pandas(full_df)
+            if self.repo_name:
+                repo_id = self.repo_name
+            else:
+                repo_id = f"{self.hf_api.whoami(self.hf_token)['name']}/{platform}_dataset_{self.unique_id}"
+                bt.logging.info(f"Pushing dataset to {repo_id}")
+                ds.push_to_hub(repo_id=repo_id, token=self.hf_token, private=False)
+
+            # 4) Удаляем локальные parquet-файлы
+            for p in parquet_paths:
+                os.remove(p)
+
+            # 5) Обновляем и сохраняем состояние
+            state['last_upload'][str(source)] = last_upload
+            state['total_rows'][str(source)] = total_rows
+            self.save_state(state)
+
+            # 6) Заполняем метаданные для возврата
+            hf_metadata_list.append(
+                HuggingFaceMetadata(
+                    repo_name=repo_id,
+                    source=source,
+                    updated_at=dt.datetime.utcnow(),
+                    encoding_key=self.encoding_key_manager.sym_key.decode()
+                )
             )
-            df.to_parquet(parquet_path, index=False)
-            parquet_paths.append(parquet_path)
-            total_rows += len(df)
-            chunk_id += 1
 
-        # Если новых чанков нет — пропускаем этот источник
-        if not parquet_paths:
-            bt.logging.warning(f"No new {platform} data, skipping upload")
-            continue
+            bt.logging.success(f"Finished uploading {platform} data: total_rows={total_rows}")
 
-        # 2) Собираем все чанки в один DataFrame и пушим на HF
-        bt.logging.info(f"Loading {len(parquet_paths)} parquet chunks for {platform}")
-        all_dfs = [pd.read_parquet(p) for p in parquet_paths]
-        full_df = pd.concat(all_dfs, ignore_index=True)
-
-        # Выбираем нужный репозиторий
-        repo_id = (
-            self.reddit_repo
-            if source == DataSource.REDDIT.value
-            else self.twitter_repo
-        )
-        bt.logging.info(f"Pushing {platform} data to HF repo {repo_id}")
-
-        ds = Dataset.from_pandas(full_df)
-        ds.push_to_hub(
-            repo_id=repo_id,
-            token=self.hf_token,
-            create_repo=True,
-            license=license,
-            private=False
-        )
-
-        # 3) Удаляем локальные parquet-файлы
-        for p in parquet_paths:
-            os.remove(p)
-
-        # 4) Обновляем и сохраняем состояние
-        state['last_upload'][str(source)] = last_upload
-        state['total_rows'][str(source)] = total_rows
-        self.save_state(state)
-
-        # 5) Собираем метаданные для сохранения в БД
-        hf_metadata_list.append(
-            HuggingFaceMetadata(
-                repo_name=repo_id,
-                source=source,
-                updated_at=dt.datetime.utcnow(),
-                encoding_key=self.encoding_key_manager.sym_key.decode()
-            )
-        )
-        bt.logging.success(f"Finished uploading {platform} data: total_rows={total_rows}")
-
-    return hf_metadata_list
+        return hf_metadata_list
 
     def collect_statistics(self, df: pd.DataFrame, source: int) -> Dict[str, Any]:
         df['datetime'] = pd.to_datetime(df['datetime'])

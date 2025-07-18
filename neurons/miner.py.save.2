@@ -155,21 +155,16 @@ class Miner:
 
         # Подключаем Hugging Face-аплоадеры
         if self.use_hf_uploader:
-# Новый единый загрузчик Hugging Face
+            # Новый единый загрузчик Hugging Face
             self.hf_uploader = DualUploader(
-                db_path=self.config.neuron.database_name,
-                subtensor=self.subtensor,
-                wallet=self.wallet,
-                encoding_key_manager=self.encoding_key_manager,
-                private_encoding_key_manager=self.private_encoding_key_manager,
-                s3_auth_url=self.config.s3_auth_url,
-                state_file=self.config.huggingface_state_file,  # e.g. "hf_state.json"
-                output_dir='hf_storage',
-                chunk_size=1_000_000,
+                state_file=self.config.huggingface_state_file,    # добавьте новое поле в config.json, например "huggingface_state_file": "hf_state.json"
                 twitter_repo=self.config.huggingface_twitter_repo,
                 reddit_repo=self.config.huggingface_reddit_repo,
                 hf_token=self.config.huggingface_token,
+                miner_wallet=self.wallet,
+                storage=self.storage,
             )
+
         # … остальной код __init__ …
 
 
@@ -262,24 +257,29 @@ class Miner:
         if not self.use_hf_uploader:
             bt.logging.info("HuggingFace Uploader is not enabled.")
             return
-    # Ждём перед первым запуском (можно настроить)
-        time.sleep(self.config.huggingface_initial_delay_seconds)
-
+        # Ждём 30 минут после старта
+        time.sleep(30 * 60)
         while not self.should_exit:
-            if self.storage.should_upload_hf_data(self.hf_uploader.unique_id):
-                try:
-                    bt.logging.info("Uploading data to Hugging Face (Twitter + Reddit)…")
-                    hf_meta_list = self.hf_uploader.upload_sql_to_huggingface(
-                        description=self.config.huggingface_description,
-                        license=self.config.huggingface_license
-                    )
-                    if hf_meta_list:
-                        self.storage.store_hf_dataset_info(hf_meta_list)
-                except Exception:
-                    bt.logging.error(traceback.format_exc())
-
-        # Ждём следующий цикл (интервал в секундах)
-        time.sleep(self.config.huggingface_interval_seconds)
+            # — Twitter —
+            if self.twitter_uploader.storage.should_upload_hf_data(self.twitter_uploader.unique_id):
+                bt.logging.info("Uploading Twitter data to Hugging Face")
+                meta = self.twitter_uploader.upload_sql_to_huggingface(
+                    description=self.config.huggingface_twitter_description,
+                    license=self.config.huggingface_license
+                )
+                if meta:
+                    self.storage.store_hf_dataset_info(meta)
+            # — Reddit —
+            if self.reddit_uploader.storage.should_upload_hf_data(self.reddit_uploader.unique_id):
+                bt.logging.info("Uploading Reddit data to Hugging Face")
+                meta = self.reddit_uploader.upload_sql_to_huggingface(
+                    description=self.config.huggingface_reddit_description,
+                    license=self.config.huggingface_license
+                )
+                if meta:
+                    self.storage.store_hf_dataset_info(meta)
+            # Ждём следующий цикл (90 минут)
+            time.sleep(90 * 60)
 
     def run(self):
         """
