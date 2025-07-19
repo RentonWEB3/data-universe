@@ -13,7 +13,6 @@ from common.data import DataLabel, DataSource, StrictBaseModel, TimeBucket
 from scraping.provider import ScraperProvider
 from scraping.scraper import ScrapeConfig, ScraperId
 from storage.miner.miner_storage import MinerStorage
-from storage.miner.sqlite_miner_storage import SqliteMinerStorage
 
 
 class LabelScrapingConfig(StrictBaseModel):
@@ -90,7 +89,7 @@ def _choose_scrape_configs(
         max_age_minutes = label_config.max_age_hint_minutes
 
         # For YouTube transcript scraper, use a wider date range
-        if scraper_id == ScraperId.YOUTUBE_TRANSCRIPT:
+        if scraper_id == ScraperId.YOUTUBE_APIFY_TRANSCRIPT:
             # Calculate the start time using max_age_minutes
             start_time = now - dt.timedelta(minutes=max_age_minutes)
 
@@ -149,61 +148,18 @@ def _choose_scrape_configs(
 class ScraperCoordinator:
     """Coordinates all the scrapers necessary based on the specified target ScrapingDistribution."""
 
-    def __init__(
-        self,
-        scraper_provider,
-        miner_storage,
-        scraping_config,
-    ):
-        """
-        scraper_provider: провайдер скрайперов (ScraperProvider)
-        miner_storage: хранилище DataEntity (MinerStorage)
-        scraping_config: словарь расписания из scraping_config.json
-        """
-        self.provider = scraper_provider
-        self.storage = miner_storage
-        self.config = scraping_config
-
-        # Tracker отвечает за очередность задач
-        now = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
-        self.tracker = ScraperCoordinator.Tracker(self.config, now)
-
-        # Максимум потоков для параллельного запуска
-        self.max_workers = 5
-
-        # Флаг работы
-        self.should_stop = False
-
-        # Очередь для задач
-        self.queue = asyncio.Queue()
-
-
     class Tracker:
         """Tracks scrape runs for the coordinator."""
 
-        def __init__(
-            self,
-            config: CoordinatorConfig,
-            now: dt.datetime,
-        ):
-            """
-            config: конфигурация расписания из CoordinatorConfig
-            now: текущее время в UTC (для инициализации трекера)
-            """
-            # Сохраняем конфиг
-            self.config = config
-
-            # Словарь: scraper_id -> интервал запуска (в секундах)
+        def __init__(self, config: CoordinatorConfig, now: dt.datetime):
             self.cadence_by_scraper_id = {
-                job.scraper_id: job.cadence_seconds
-                for job in config.scraping_jobs
+                scraper_id: dt.timedelta(seconds=cfg.cadence_seconds)
+                for scraper_id, cfg in config.scraper_configs.items()
             }
 
-            # Словарь: scraper_id -> время последнего запуска
-            # Инициализируем так, чтобы все скрайперы были готовы при первом опросе
-            self.last_scrape_time_per_scraper = {
-                scraper_id: None
-                for scraper_id in self.cadence_by_scraper_id
+            # Initialize the last scrape time as now, to protect against frequent scraping during Miner crash loops.
+            self.last_scrape_time_per_scraper_id: Dict[ScraperId, dt.datetime] = {
+                scraper_id: now for scraper_id in config.scraper_configs.keys()
             }
 
         def get_scraper_ids_ready_to_scrape(self, now: dt.datetime) -> List[ScraperId]:
@@ -221,6 +177,20 @@ class ScraperCoordinator:
             """Notifies the tracker that a scrape has been scheduled."""
             self.last_scrape_time_per_scraper_id[scraper_id] = now
 
+    def __init__(
+        self,
+        scraper_provider: ScraperProvider,
+        miner_storage: MinerStorage,
+        config: CoordinatorConfig,
+    ):
+        self.provider = scraper_provider
+        self.storage = miner_storage
+        self.config = config
+
+        self.tracker = ScraperCoordinator.Tracker(self.config, dt.datetime.utcnow())
+        self.max_workers = 5
+        self.is_running = False
+        self.queue = asyncio.Queue()
 
     def run_in_background_thread(self):
         """
@@ -241,51 +211,56 @@ class ScraperCoordinator:
         bt.logging.info("Stopping the ScrapingCoordinator.")
         self.is_running = False
 
-import asyncio
-import functools
-import datetime as dt
-import traceback
-import bittensor as bt
-
-class ScraperCoordinator:
-    # … ваш конструктор, где вы уже сохранили self.miner_storage и self.config, self.provider …
-
     async def _start(self):
-        self.queue = asyncio.Queue()
-        workers = [asyncio.create_task(self._worker(f"worker-{i}")) for i in range(self.max_workers)]
-        self.is_running = True
+        workers = []
+        for i in range(self.max_workers):
+            worker = asyncio.create_task(
+                self._worker(
+                    f"worker-{i}",
+                )
+            )
+            workers.append(worker)
 
-        while self.is_running and not self.should_exit:
+        while self.is_running:
             now = dt.datetime.utcnow()
-            ids = self.tracker.get_scraper_ids_ready_to_scrape(now)
-            if not ids:
+            scraper_ids_to_scrape_now = self.tracker.get_scraper_ids_ready_to_scrape(
+                now
+            )
+            if not scraper_ids_to_scrape_now:
+                bt.logging.trace("Nothing ready to scrape yet. Trying again in 15s.")
+                # Nothing is due a scrape. Wait a few seconds and try again
                 await asyncio.sleep(15)
                 continue
-            for scraper_id in ids:
+
+            for scraper_id in scraper_ids_to_scrape_now:
                 scraper = self.provider.get(scraper_id)
-                configs = _choose_scrape_configs(scraper_id, self.config, now)
-                for cfg in configs:
-                    self.queue.put_nowait(functools.partial(scraper.scrape, cfg))
+
+                scrape_configs = _choose_scrape_configs(scraper_id, self.config, now)
+
+                for config in scrape_configs:
+                    # Use .partial here to make sure the functions arguments are copied/stored
+                    # now rather than being lazily evaluated (if a lambda was used).
+                    # https://pylint.readthedocs.io/en/latest/user_guide/messages/warning/cell-var-from-loop.html#cell-var-from-loop-w0640
+                    bt.logging.trace(f"Adding scrape task for {scraper_id}: {config}.")
+                    self.queue.put_nowait(functools.partial(scraper.scrape, config))
+
                 self.tracker.on_scrape_scheduled(scraper_id, now)
 
-        await self.queue.join()
-        for w in workers:
-            w.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
+        bt.logging.info("Coordinator shutting down. Waiting for workers to finish.")
+        await asyncio.gather(*workers)
         bt.logging.info("Coordinator stopped.")
 
-    async def _worker(self, name: str):
-        bt.logging.info(f"{name} started.")
-        while not self.should_exit:
+    async def _worker(self, name):
+        """A worker thread"""
+        while self.is_running:
             try:
-                task = await self.queue.get()
-                entities = await task()
-                self.miner_storage.store_data_entities(entities)
-                bt.logging.info(f"{name}: Stored {len(entities)} entities.")
-            except Exception as e:
-                bt.logging.error(f"{name} error: {e}")
-                bt.logging.debug(traceback.format_exc())
-            finally:
-                self.queue.task_done()
-        bt.logging.info(f"{name} exiting.")
+                # Wait for a scraping task to be added to the queue.
+                scrape_fn = await self.queue.get()
 
+                # Perform the scrape
+                data_entities = await scrape_fn()
+
+                self.storage.store_data_entities(data_entities)
+                self.queue.task_done()
+            except Exception as e:
+                bt.logging.error("Worker " + name + ": " + traceback.format_exc())

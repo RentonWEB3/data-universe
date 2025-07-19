@@ -20,7 +20,7 @@
   "db_path": "data_universe.db",
 
   "huggingface": true,
-  "huggingface_token": "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",
+  "huggingface_token": "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",
   "huggingface_state_file": "hf_state.json",
   "huggingface_twitter_repo": "RentonWEB3/crypto-tweets",
   "huggingface_reddit_repo": "RentonWEB3/crypto-reddit",
